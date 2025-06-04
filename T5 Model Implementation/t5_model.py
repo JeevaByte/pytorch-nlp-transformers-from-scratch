@@ -87,6 +87,8 @@ class T5Attention(nn.Module):
         
     def forward(self, query, key, value, mask=None, position_bias=None):
         batch_size = query.size(0)
+        q_seq_len = query.size(1)
+        k_seq_len = key.size(1)
         
         # Linear projections and reshape
         q = self.q(query).view(batch_size, -1, self.num_heads, self.d_k).transpose(1, 2)
@@ -98,16 +100,21 @@ class T5Attention(nn.Module):
         
         # Add relative position bias if needed
         if position_bias is None and self.has_relative_attention_bias:
-            seq_length = query.size(1)
-            position_bias = self.relative_attention_bias.compute_bias(seq_length)
+            position_bias = self.relative_attention_bias.compute_bias(max(q_seq_len, k_seq_len))
+            # Slice to the correct size if needed
+            if position_bias.size(-1) > k_seq_len or position_bias.size(-2) > q_seq_len:
+                position_bias = position_bias[:, :q_seq_len, :k_seq_len]
             position_bias = position_bias.unsqueeze(0)  # Add batch dimension
             
         if position_bias is not None:
+            # Ensure position_bias has the right shape for broadcasting
+            if position_bias.size(0) == 1:
+                position_bias = position_bias.expand(batch_size, -1, -1, -1)
             scores = scores + position_bias
             
         # Apply mask if provided
         if mask is not None:
-            scores = scores.masked_fill(mask == 0, -1e9)
+            scores = scores + mask
             
         # Apply softmax and dropout
         attn_weights = F.softmax(scores, dim=-1)
@@ -241,7 +248,8 @@ class T5Encoder(nn.Module):
         
         # Create attention mask if provided
         if attention_mask is not None:
-            attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
+            # Convert mask of 1s and 0s to mask of 0s and -1e9
+            attention_mask = (1.0 - attention_mask.unsqueeze(1).unsqueeze(2)) * -1e9
         
         # Initialize position bias
         position_bias = None
@@ -278,9 +286,16 @@ class T5Decoder(nn.Module):
         
         # Create attention masks if provided
         if self_attention_mask is not None:
-            self_attention_mask = self_attention_mask.unsqueeze(1).unsqueeze(2)
+            # Create causal mask for decoder self-attention
+            seq_length = input_ids.size(1)
+            causal_mask = torch.tril(torch.ones(seq_length, seq_length, device=input_ids.device)).unsqueeze(0).unsqueeze(0)
+            self_attention_mask = self_attention_mask.unsqueeze(1).unsqueeze(2) * causal_mask
+            # Convert mask of 1s and 0s to mask of 0s and -1e9
+            self_attention_mask = (1.0 - self_attention_mask) * -1e9
+            
         if cross_attention_mask is not None:
-            cross_attention_mask = cross_attention_mask.unsqueeze(1).unsqueeze(2)
+            # Convert mask of 1s and 0s to mask of 0s and -1e9
+            cross_attention_mask = (1.0 - cross_attention_mask.unsqueeze(1).unsqueeze(2)) * -1e9
         
         # Initialize position biases
         self_position_bias = None
@@ -315,18 +330,12 @@ class T5Model(nn.Module):
         # Encode input sequence
         encoder_output = self.encoder(input_ids, encoder_attention_mask)
         
-        # Create cross attention mask
-        if encoder_attention_mask is not None:
-            cross_attention_mask = encoder_attention_mask.unsqueeze(1).expand(-1, decoder_input_ids.size(1), -1)
-        else:
-            cross_attention_mask = None
-        
         # Decode output sequence
         decoder_output = self.decoder(
             decoder_input_ids, 
             encoder_output, 
             decoder_attention_mask, 
-            cross_attention_mask
+            encoder_attention_mask
         )
         
         # Project to vocabulary
@@ -346,25 +355,17 @@ class T5Model(nn.Module):
             # Initialize decoder input with BOS token
             decoder_input_ids = torch.ones((batch_size, 1), dtype=torch.long, device=input_ids.device) * bos_token_id
             
-            # Create cross attention mask
-            if encoder_attention_mask is not None:
-                cross_attention_mask = encoder_attention_mask.unsqueeze(1)
-            else:
-                cross_attention_mask = None
-            
             # Generate tokens one by one
             for _ in range(max_length - 1):
-                # Create causal mask for decoder
-                decoder_attention_mask = torch.tril(
-                    torch.ones((decoder_input_ids.size(1), decoder_input_ids.size(1)), device=input_ids.device)
-                ).unsqueeze(0).unsqueeze(0)
+                # Create decoder attention mask
+                decoder_attention_mask = torch.ones_like(decoder_input_ids)
                 
                 # Decode current sequence
                 decoder_output = self.decoder(
                     decoder_input_ids, 
                     encoder_output, 
                     decoder_attention_mask, 
-                    cross_attention_mask
+                    encoder_attention_mask
                 )
                 
                 # Get next token prediction

@@ -22,7 +22,8 @@ class MultiHeadAttention(nn.Module):
         attn_scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_k)
         
         if mask is not None:
-            attn_scores = attn_scores.masked_fill(mask == 0, -1e9)
+            # Make sure mask is broadcastable to attention scores
+            attn_scores = attn_scores + mask
             
         attn_probs = F.softmax(attn_scores, dim=-1)
         output = torch.matmul(attn_probs, V)
@@ -146,10 +147,19 @@ class BERT(nn.Module):
         # Embedding
         embeddings = self.embeddings(input_ids, segment_ids)
         
+        # Prepare attention mask for multi-head attention
+        if attention_mask is not None:
+            # Expand attention mask to [batch_size, 1, 1, seq_length]
+            extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
+            # Convert mask of 1s and 0s to mask of 0s and -1e9
+            extended_attention_mask = (1.0 - extended_attention_mask) * -1e9
+        else:
+            extended_attention_mask = None
+        
         # Encoder layers
         x = embeddings
         for layer in self.encoder_layers:
-            x = layer(x, attention_mask)
+            x = layer(x, extended_attention_mask)
             
         # Pooled output for classification tasks
         pooled_output = self.pooler_activation(self.pooler(x[:, 0]))
